@@ -2,7 +2,7 @@ use futures::{channel::mpsc, stream::FuturesUnordered, Future, StreamExt};
 use madsim::{
     fs, net,
     rand::{self, Rng},
-    task,
+    task::{self, Task},
     time::{self, *},
 };
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,8 @@ struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     state: State,
+
+    tasks: Vec<Task<()>>,
 
     // Last term this peer voted for. All vote requests with term <= this value are rejected.
     term_voted: u64,
@@ -179,6 +181,7 @@ impl RaftHandle {
             me,
             apply_ch,
             state: State::default(),
+            tasks: vec![],
             term_voted: 0,
             election_timeout_reset: Instant::now(),
         }));
@@ -194,6 +197,7 @@ impl RaftHandle {
     /// Transfer raft state.
     fn transfer_state(&mut self, term: u64, role: Role) {
         let mut raft = self.raft();
+        raft.abort_tasks();
         raft.set_term(term);
         raft.set_role(role);
         drop(raft);
@@ -210,9 +214,8 @@ impl RaftHandle {
     // This task can only be performed by a peer who considers himself as a leader.
     fn spawn_heartbeat_task(&mut self, term: u64) {
         let mut handle = self.clone();
-        task::spawn(async move {
+        self.raft().spawn_task(async move {
             info!("running heartbeat task");
-            let state = handle.raft().state();
             loop {
                 let mut rpcs = {
                     let raft = handle.raft();
@@ -222,36 +225,26 @@ impl RaftHandle {
 
                 info!("broadcasting heartbeats");
                 while let Some(Ok(res)) = rpcs.next().await {
-                    let raft = handle.raft();
-                    if raft.state_changed(&state) {
-                        return;
-                    }
-
                     // We've just discovered there is a leader or a candidate with a higher
                     // term, transfer state to follower. (3.3)
                     if res.term > term {
-                        drop(raft);
                         return handle.transfer_state(res.term, Role::Follower);
                     }
                 }
 
                 time::sleep(Raft::generate_heartbeat_timeout()).await;
-                if handle.raft().state_changed(&state) {
-                    return;
-                }
             }
         })
-        .detach()
     }
 
     // Spawn a task performing election for the current peer with specified term.
     // This task can only be performed by a candidate.
     fn spawn_election_task(&mut self, term: u64) {
         let mut handle = self.clone();
-        task::spawn(async move {
+        self.raft().spawn_task(async move {
             // Vote for this peer.
             let mut votes = 1;
-            let (mut rpcs, state) = {
+            let mut rpcs = {
                 let mut raft = handle.raft();
                 raft.term_voted = term;
                 let req = RequestVoteArgs {
@@ -259,7 +252,7 @@ impl RaftHandle {
                     term,
                 };
                 info!("broadcasting vote requests");
-                (broadcast_vote_request(&raft.peers, &req), raft.state())
+                broadcast_vote_request(&raft.peers, &req)
             };
 
             // Note: not all of the errors should affect the election.
@@ -268,25 +261,18 @@ impl RaftHandle {
             // new election started by the election timeout taskthe .
             while let Some(Ok(res)) = rpcs.next().await {
                 info!("got reply: {res:?}");
-                let raft = handle.raft();
-                if raft.state_changed(&state) {
-                    return;
-                }
-
                 if res.vote_granted {
                     votes += 1;
                 }
 
                 // Check for majority.
-                if votes >= raft.peers.len() / 2 + 1 {
-                    info!("peer {} won election", raft.me);
-                    drop(raft);
+                if votes >= handle.raft().peers.len() / 2 + 1 {
+                    info!("peer {} won election", handle.raft().me);
                     return handle.transfer_state(term, Role::Leader);
                 }
             }
             info!("peer {} lost election", handle.raft().me);
-        })
-        .detach();
+        });
 
         // Spawn an election timeout task to handle communication errors.
         self.spawn_election_timeout_task(term);
@@ -296,31 +282,20 @@ impl RaftHandle {
     // This task can only be performed by a follower peer.
     fn spawn_election_timeout_task(&mut self, term: u64) {
         let mut handle = self.clone();
-        task::spawn(async move {
+        self.raft().spawn_task(async move {
             info!("running leader tracker task");
-            let state = {
-                let mut raft = handle.raft();
-                raft.reset_election_timeout();
-                raft.state()
-            };
+            handle.raft().reset_election_timeout();
 
             loop {
                 let timeout = Raft::generate_election_timeout();
                 time::sleep(timeout.clone()).await;
 
-                let raft = handle.raft();
-                if raft.state_changed(&state) {
-                    return;
-                }
-
-                if raft.timed_out(timeout) {
+                if handle.raft().timed_out(timeout) {
                     info!("election timeout's been reached");
-                    drop(raft);
                     return handle.transfer_state(term + 1, Role::Candidate);
                 }
             }
         })
-        .detach();
     }
 
     /// Start agreement on the next command to be appended to Raft's log.
@@ -482,11 +457,11 @@ impl RaftHandle {
             if raft.term() <= args.term {
                 raft.reset_election_timeout();
             }
+            drop(raft);
 
             // We've just discovered there is a leader or a candidate with a higher
             // term, transfer state to follower. (3.3)
             if term < args.term {
-                drop(raft);
                 self.transfer_state(args.term, Role::Follower);
             }
 
@@ -527,6 +502,18 @@ impl Raft {
         Duration::from_millis(rand::rng().gen_range(150..300))
     }
 
+    // A helper function for spawning tasks and store them.
+    fn spawn_task<F>(&mut self, f: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.tasks.push(task::spawn(f))
+    }
+
+    fn abort_tasks(&mut self) {
+        self.tasks.clear()
+    }
+
     fn generate_heartbeat_timeout() -> Duration {
         Duration::from_millis(50)
     }
@@ -546,16 +533,6 @@ impl Raft {
 
     fn set_role(&mut self, role: Role) {
         self.state.set_role(role)
-    }
-
-    fn state(&self) -> State {
-        self.state
-    }
-
-    /// Check if the state changed.
-    /// State checks must be performed after awaiting, as awaiting can change the state.
-    fn state_changed(&self, state: &State) -> bool {
-        self.state != *state
     }
 
     fn reset_election_timeout(&mut self) {
