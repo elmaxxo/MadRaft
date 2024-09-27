@@ -120,9 +120,12 @@ impl fmt::Debug for Raft {
 }
 
 /// Send vote request to the peer.
-async fn send_vote_request(peer: SocketAddr, req: RequestVoteArgs) -> io::Result<RequestVoteReply> {
+async fn send_vote_request(
+    peer: SocketAddr,
+    req: RequestVoteArgs,
+    timeout: Duration,
+) -> io::Result<RequestVoteReply> {
     let net = net::NetLocalHandle::current();
-    let timeout = time::Duration::from_secs(1);
     net.call_timeout(peer, req, timeout).await
 }
 
@@ -130,6 +133,7 @@ async fn send_vote_request(peer: SocketAddr, req: RequestVoteArgs) -> io::Result
 fn broadcast_vote_request(
     peers: &[SocketAddr],
     req: &RequestVoteArgs,
+    timeout: &Duration,
 ) -> FuturesUnordered<impl Future<Output = io::Result<RequestVoteReply>>> {
     let rpcs = FuturesUnordered::new();
     peers
@@ -137,9 +141,9 @@ fn broadcast_vote_request(
         .enumerate()
         .filter(|(peer_idx, _)| *peer_idx != req.candidate)
         .for_each(|(_, peer)| {
-            let (peer, req) = (peer.clone(), req.clone());
+            let (peer, req, timeout) = (peer.clone(), req.clone(), timeout.clone());
             info!("sending vote request to {peer:?}");
-            rpcs.push(async move { send_vote_request(peer, req).await });
+            rpcs.push(async move { send_vote_request(peer, req, timeout).await });
         });
     rpcs
 }
@@ -148,9 +152,9 @@ fn broadcast_vote_request(
 async fn send_append_entries(
     peer: SocketAddr,
     req: AppendEntriesArgs,
+    timeout: Duration,
 ) -> io::Result<AppendEntriesReply> {
     let net = net::NetLocalHandle::current();
-    let timeout = time::Duration::from_secs(1);
     info!("sending append entries to {peer:?}");
     net.call_timeout(peer, req, timeout).await
 }
@@ -160,6 +164,7 @@ fn broadcast_append_entries(
     peers: &[SocketAddr],
     req: &AppendEntriesArgs,
     me: usize,
+    timeout: &Duration,
 ) -> FuturesUnordered<impl Future<Output = io::Result<AppendEntriesReply>>> {
     let rpcs = FuturesUnordered::new();
     peers
@@ -167,8 +172,8 @@ fn broadcast_append_entries(
         .enumerate()
         .filter(|(peer_idx, _)| *peer_idx != me)
         .for_each(|(_, peer)| {
-            let (peer, req) = (peer.clone(), req.clone());
-            rpcs.push(async move { send_append_entries(peer, req).await });
+            let (peer, req, timeout) = (peer.clone(), req.clone(), timeout.clone());
+            rpcs.push(async move { send_append_entries(peer, req, timeout).await });
         });
     rpcs
 }
@@ -217,10 +222,11 @@ impl RaftHandle {
         self.raft().spawn_task(async move {
             info!("running heartbeat task");
             loop {
+                let timeout = Raft::generate_heartbeat_timeout();
                 let mut rpcs = {
                     let raft = handle.raft();
                     let req = AppendEntriesArgs { term };
-                    broadcast_append_entries(&raft.peers, &req, raft.me)
+                    broadcast_append_entries(&raft.peers, &req, raft.me, &timeout)
                 };
 
                 info!("broadcasting heartbeats");
@@ -232,7 +238,7 @@ impl RaftHandle {
                     }
                 }
 
-                time::sleep(Raft::generate_heartbeat_timeout()).await;
+                time::sleep(timeout).await;
             }
         })
     }
@@ -252,13 +258,13 @@ impl RaftHandle {
                     term,
                 };
                 info!("broadcasting vote requests");
-                broadcast_vote_request(&raft.peers, &req)
+                broadcast_vote_request(&raft.peers, &req, &Raft::generate_election_timeout())
             };
 
             // Note: not all of the errors should affect the election.
             // For instance, if one of the peers timed out, we still can win the election.
-            // If we didn't won the election and didn't discover a new leader, we will perform a
-            // new election started by the election timeout taskthe .
+            // If we didn't won the election and didn't discover a new leader, the election
+            // timeout task will start a new election.
             while let Some(Ok(res)) = rpcs.next().await {
                 info!("got reply: {res:?}");
                 if res.vote_granted {
@@ -274,12 +280,12 @@ impl RaftHandle {
             info!("peer {} lost election", handle.raft().me);
         });
 
-        // Spawn an election timeout task to handle communication errors.
+        // Spawn an election timeout task to handle split votes and communication errors.
         self.spawn_election_timeout_task(term);
     }
 
     // Spawn an task tracking for election timeout.
-    // This task can only be performed by a follower peer.
+    // This task can only be performed by a follower or a candidate peer.
     fn spawn_election_timeout_task(&mut self, term: u64) {
         let mut handle = self.clone();
         self.raft().spawn_task(async move {
@@ -453,19 +459,24 @@ impl RaftHandle {
         let reply = {
             let mut raft = self.raft();
             let term = raft.term();
-            // Reset election timeout if we've git a message from the leader.
+            let is_candidate = raft.state.role == Role::Candidate;
+            // Reset election timeout if we've get a message from the leader.
             if raft.term() <= args.term {
                 raft.reset_election_timeout();
             }
             drop(raft);
 
-            // We've just discovered there is a leader or a candidate with a higher
+            // We've lost this election
+            // or
+            // we've just discovered there is a leader or a candidate with a higher
             // term, transfer state to follower. (3.3)
-            if term < args.term {
+            if (is_candidate && term == args.term) || term < args.term {
                 self.transfer_state(args.term, Role::Follower);
             }
 
-            AppendEntriesReply { term }
+            AppendEntriesReply {
+                term: self.raft().term(),
+            }
         };
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
