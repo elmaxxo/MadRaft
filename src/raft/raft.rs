@@ -7,7 +7,7 @@ use madsim::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt::{self, Pointer},
+    fmt::{self},
     io,
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
@@ -126,6 +126,7 @@ async fn send_vote_request(
     timeout: Duration,
 ) -> io::Result<RequestVoteReply> {
     let net = net::NetLocalHandle::current();
+    info!("sending vote request to {peer:?}");
     net.call_timeout(peer, req, timeout).await
 }
 
@@ -142,7 +143,6 @@ fn broadcast_vote_request(
         .filter(|(peer_idx, _)| *peer_idx != req.candidate)
         .for_each(|(_, peer)| {
             let (peer, req, timeout) = (peer.clone(), req.clone(), timeout.clone());
-            info!("sending vote request to {peer:?}");
             rpcs.push(async move { send_vote_request(peer, req, timeout).await });
         });
     rpcs
@@ -202,12 +202,15 @@ impl RaftHandle {
     /// Transfer raft state.
     fn transfer_state(&mut self, term: u64, role: Role) {
         let mut raft = self.raft();
+        info!(
+            "{}: transfering state to ({role:?}, {term})",
+            raft.describe()
+        );
         raft.abort_tasks();
         raft.set_term(term);
         raft.set_role(role);
         drop(raft);
 
-        info!("transfering state to ({role:?}, {term})");
         match role {
             Role::Leader => self.spawn_heartbeat_task(term),
             Role::Candidate => self.spawn_election_task(term),
@@ -220,7 +223,7 @@ impl RaftHandle {
     fn spawn_heartbeat_task(&mut self, term: u64) {
         let mut handle = self.clone();
         self.raft().spawn_task(async move {
-            info!("running heartbeat task");
+            info!("{}: running heartbeat task", handle.raft().describe());
             loop {
                 let timeout = Raft::generate_heartbeat_timeout();
                 let mut rpcs = {
@@ -229,7 +232,7 @@ impl RaftHandle {
                     broadcast_append_entries(&raft.peers, &req, raft.me, &timeout)
                 };
 
-                info!("broadcasting heartbeats");
+                info!("{}: broadcasting heartbeats", handle.raft().describe());
                 while let Some(Ok(res)) = rpcs.next().await {
                     // We've just discovered there is a leader or a candidate with a higher
                     // term, transfer state to follower. (3.3)
@@ -257,7 +260,6 @@ impl RaftHandle {
                     candidate: raft.me,
                     term,
                 };
-                info!("broadcasting vote requests");
                 broadcast_vote_request(&raft.peers, &req, &Raft::generate_election_timeout())
             };
 
@@ -265,6 +267,7 @@ impl RaftHandle {
             // For instance, if one of the peers timed out, we still can win the election.
             // If we didn't won the election and didn't discover a new leader, the election
             // timeout task will start a new election.
+            info!("{}: broadcasting vote requests", handle.raft().describe());
             while let Some(Ok(res)) = rpcs.next().await {
                 info!("got reply: {res:?}");
                 if res.vote_granted {
@@ -273,11 +276,11 @@ impl RaftHandle {
 
                 // Check for majority.
                 if votes >= handle.raft().peers.len() / 2 + 1 {
-                    info!("peer {} won election", handle.raft().me);
+                    info!("{}: won election", handle.raft().describe());
                     return handle.transfer_state(term, Role::Leader);
                 }
             }
-            info!("peer {} lost election", handle.raft().me);
+            info!("{}: lost election", handle.raft().describe());
         });
 
         // Spawn an election timeout task to handle split votes and communication errors.
@@ -289,7 +292,7 @@ impl RaftHandle {
     fn spawn_election_timeout_task(&mut self, term: u64) {
         let mut handle = self.clone();
         self.raft().spawn_task(async move {
-            info!("running leader tracker task");
+            info!("{}: running leader tracker task", handle.raft().describe());
             handle.raft().reset_election_timeout();
 
             loop {
@@ -297,7 +300,10 @@ impl RaftHandle {
                 time::sleep(timeout.clone()).await;
 
                 if handle.raft().timed_out(timeout) {
-                    info!("election timeout's been reached");
+                    info!(
+                        "{}: election timeout's been reached",
+                        handle.raft().describe()
+                    );
                     return handle.transfer_state(term + 1, Role::Candidate);
                 }
             }
@@ -314,6 +320,10 @@ impl RaftHandle {
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
         let mut raft = self.inner.lock().unwrap();
         info!("{:?} start", *raft);
+        //if !self.raft().state.is_leader() {
+        //    let leader = (self.me + 1) % self.peers.len();
+        //    return Err(Error::NotLeader(leader));
+        //}
         raft.start(cmd)
     }
 
@@ -412,7 +422,10 @@ impl RaftHandle {
 
     // Rpc handler for request vote message.
     async fn request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
-        info!("running request vote rpc: {args:?}");
+        info!(
+            "{}: running request vote rpc: {args:?}",
+            self.raft().describe()
+        );
         let mut get_reply = || {
             let term = self.raft().term();
             // Don't vote for stale terms.
@@ -449,13 +462,19 @@ impl RaftHandle {
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
         // self.persist().await.expect("failed to persist");
-        info!("finished request vote rpc: {reply:?}");
+        info!(
+            "{}: processed request vote rpc: {reply:?}",
+            self.raft().describe()
+        );
         reply
     }
 
     // Rpc handler for append entries message.
     async fn append_entries(&mut self, args: AppendEntriesArgs) -> Result<AppendEntriesReply> {
-        info!("running append entries rpc: {args:?}");
+        info!(
+            "{}: running append entries rpc: {args:?}",
+            self.raft().describe()
+        );
         let reply = {
             let mut raft = self.raft();
             let term = raft.term();
@@ -481,7 +500,10 @@ impl RaftHandle {
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
         // self.persist().await.expect("failed to persist");
-        info!("finished append entries rpc: {reply:?}");
+        info!(
+            "{}: processed append entries rpc: {reply:?}",
+            self.raft().describe()
+        );
         Ok(reply)
     }
 
@@ -493,10 +515,6 @@ impl RaftHandle {
 // HINT: put mutable non-async functions here
 impl Raft {
     fn start(&mut self, data: &[u8]) -> Result<Start> {
-        if !self.state.is_leader() {
-            let leader = (self.me + 1) % self.peers.len();
-            return Err(Error::NotLeader(leader));
-        }
         todo!("start agreement");
     }
 
@@ -548,6 +566,13 @@ impl Raft {
 
     fn reset_election_timeout(&mut self) {
         self.election_timeout_reset = Instant::now();
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "raft(peer: {}, role: {:?}, term: {})",
+            self.me, self.state.role, self.state.term
+        )
     }
 }
 
