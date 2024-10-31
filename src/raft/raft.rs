@@ -1,3 +1,4 @@
+use super::log::Log;
 use futures::{channel::mpsc, stream::FuturesUnordered, Future, StreamExt};
 use madsim::{
     fs, net,
@@ -7,9 +8,11 @@ use madsim::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fmt::{self},
     io,
     net::SocketAddr,
+    ops::AddAssign,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -51,6 +54,8 @@ pub enum Error {
     NotLeader(usize),
     #[error("IO error")]
     IO(#[from] io::Error),
+    #[error("no such index {0}")]
+    NoSuchIndex(usize),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +77,12 @@ struct Raft {
 
     // Time at which election timeout starts counting.
     election_timeout_reset: Instant,
+
+    log: Log<Vec<u8>>,
+
+    last_committed: u64,
+
+    next_index: HashMap<SocketAddr, u64>,
 }
 
 /// State of a raft peer.
@@ -151,9 +162,9 @@ fn broadcast_vote_request(
 /// Send append entries to the peer.
 async fn send_append_entries(
     peer: SocketAddr,
-    req: AppendEntriesArgs,
+    req: AppendEntryArgs,
     timeout: Duration,
-) -> io::Result<AppendEntriesReply> {
+) -> io::Result<AppendEntryReply> {
     let net = net::NetLocalHandle::current();
     info!("sending append entries to {peer:?}");
     net.call_timeout(peer, req, timeout).await
@@ -162,10 +173,10 @@ async fn send_append_entries(
 /// Create a set of futures that broadcast append entries to all peers.
 fn broadcast_append_entries(
     peers: &[SocketAddr],
-    req: &AppendEntriesArgs,
+    req: &AppendEntryArgs,
     me: usize,
     timeout: &Duration,
-) -> FuturesUnordered<impl Future<Output = io::Result<AppendEntriesReply>>> {
+) -> FuturesUnordered<impl Future<Output = io::Result<AppendEntryReply>>> {
     let rpcs = FuturesUnordered::new();
     peers
         .iter()
@@ -181,6 +192,8 @@ fn broadcast_append_entries(
 impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let (apply_ch, recver) = mpsc::unbounded();
+        // Log starts with 1 index.
+        let next_index = peers.iter().map(|peer| (peer.clone(), 1)).collect();
         let inner = Arc::new(Mutex::new(Raft {
             peers,
             me,
@@ -189,6 +202,9 @@ impl RaftHandle {
             tasks: vec![],
             term_voted: 0,
             election_timeout_reset: Instant::now(),
+            log: Log::new(),
+            last_committed: 0,
+            next_index,
         }));
         let mut handle = RaftHandle { inner };
         // initialize from state persisted before a crash
@@ -212,9 +228,22 @@ impl RaftHandle {
         drop(raft);
 
         match role {
-            Role::Leader => self.spawn_heartbeat_task(term),
+            Role::Leader => self.spawn_leader_tasks(term),
             Role::Candidate => self.spawn_election_task(term),
             Role::Follower => self.spawn_election_timeout_task(term),
+        }
+    }
+
+    fn spawn_leader_tasks(&mut self, term: u64) {
+        self.spawn_heartbeat_task(term);
+        let (me, peers) = {
+            let raft = self.raft();
+            (raft.me, raft.peers.clone())
+        };
+        for (idx, peer) in peers.iter().enumerate() {
+            if idx != me {
+                self.spawn_replication_task(*peer);
+            }
         }
     }
 
@@ -225,10 +254,15 @@ impl RaftHandle {
         self.raft().spawn_task(async move {
             info!("{}: running heartbeat task", handle.raft().describe());
             loop {
-                let timeout = Raft::generate_heartbeat_timeout();
+                let timeout = Raft::heartbeat_timeout();
                 let mut rpcs = {
                     let raft = handle.raft();
-                    let req = AppendEntriesArgs { term };
+                    let req = AppendEntryArgs {
+                        term,
+                        last_committed: raft.last_committed,
+                        index: raft.log.len(),
+                        entry: vec![],
+                    };
                     broadcast_append_entries(&raft.peers, &req, raft.me, &timeout)
                 };
 
@@ -275,7 +309,7 @@ impl RaftHandle {
                 }
 
                 // Check for majority.
-                if votes >= handle.raft().peers.len() / 2 + 1 {
+                if handle.raft().is_majority(votes) {
                     info!("{}: won election", handle.raft().describe());
                     return handle.transfer_state(term, Role::Leader);
                 }
@@ -318,14 +352,109 @@ impl RaftHandle {
     /// There is no guarantee that this command will ever be committed to the
     /// Raft log, since the leader may fail or lose an election.
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
-        let mut raft = self.inner.lock().unwrap();
-        info!("{:?} start", *raft);
-        //if !self.raft().state.is_leader() {
-        //    let leader = (self.me + 1) % self.peers.len();
-        //    return Err(Error::NotLeader(leader));
-        //}
-        raft.start(cmd)
+        let mut raft = self.raft();
+        if !raft.state.is_leader() {
+            let leader = (raft.me + 1) % raft.peers.len();
+            return Err(Error::NotLeader(leader));
+        }
+        info!("{}: starting agreement {:?}", raft.describe(), cmd);
+        let term = raft.term();
+        let index = raft.log.append(term, cmd.to_vec());
+        Ok(Start { index, term })
     }
+
+    pub fn spawn_replication_task(&self, peer: SocketAddr) {
+        let mut handle = self.clone();
+        let term = self.raft().term();
+
+        self.raft().spawn_task(async move {
+            loop {
+                let (index, term_and_entry) = {
+                    let raft = handle.raft();
+                    let next_index = raft.next_index[&peer];
+                    let term_and_entry = raft
+                        .log
+                        .term_and_entry(next_index)
+                        .map(|(t, e)| (t, e.to_vec()));
+                    (next_index, term_and_entry)
+                };
+
+                let Some((entry_term, entry)) = term_and_entry else {
+                    time::sleep(Raft::log_inspection_timeout()).await;
+                    continue;
+                };
+
+                let req = AppendEntryArgs {
+                    index,
+                    term: entry_term,
+                    last_committed: handle.raft().last_committed,
+                    entry,
+                };
+                let rpc = send_append_entries(peer, req, Raft::heartbeat_timeout());
+                if let Ok(resp) = rpc.await {
+                    let mut raft = handle.raft();
+                    if resp.success {
+                        raft.advance_next_index(&peer);
+                        raft.try_commit_new_entries();
+                    } else {
+                        todo!()
+                    }
+                };
+
+                time::sleep(Raft::log_inspection_timeout()).await;
+            }
+        })
+    }
+
+    //pub fn spawn_command_replication_task(&self, index: LogIndex) {
+    //    let mut handle = self.clone();
+    //    let mut raft = self.raft();
+    //    let Some(entry) = raft.log.get(index).cloned() else {
+    //        // Entry has been overwritten.
+    //        return;
+    //    };
+    //    let payload = entry.payload.clone();
+    //    let term = raft.term();
+    //    raft.spawn_task(async move {
+    //        let req = AppendEntriesArgs { term, payload };
+    //        loop {
+    //            if handle.raft().log.is_commited(index) {
+    //                return;
+    //            }
+    //
+    //            let mut rpcs = {
+    //                let raft = handle.raft();
+    //                info!(
+    //                    "{}: broadcasting append entries {:?}",
+    //                    raft.describe(),
+    //                    &req
+    //                );
+    //                broadcast_append_entries(
+    //                    &raft.peers,
+    //                    &req,
+    //                    raft.me,
+    //                    &Raft::generate_heartbeat_timeout(),
+    //                )
+    //            };
+    //
+    //            let mut confirmed = 1;
+    //            while let Some(Ok(res)) = rpcs.next().await {
+    //                if term < res.term {
+    //                    return handle.transfer_state(res.term, Role::Follower);
+    //                }
+    //
+    //                confirmed += 1;
+    //                let mut raft = handle.raft();
+    //                if raft.is_majority(confirmed) {
+    //                    info!("{}: commiting index {:?}", raft.describe(), index);
+    //                    raft.log.commit(index);
+    //                    raft.apply(entry);
+    //                    return;
+    //                }
+    //            }
+    //        }
+    //    })
+    //}
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
@@ -413,7 +542,7 @@ impl RaftHandle {
         });
 
         let that = self.clone();
-        net.add_rpc_handler(move |args: AppendEntriesArgs| {
+        net.add_rpc_handler(move |args: AppendEntryArgs| {
             let mut this = that.clone();
             async move { this.append_entries(args).await.unwrap() }
         });
@@ -470,7 +599,7 @@ impl RaftHandle {
     }
 
     // Rpc handler for append entries message.
-    async fn append_entries(&mut self, args: AppendEntriesArgs) -> Result<AppendEntriesReply> {
+    async fn append_entries(&mut self, args: AppendEntryArgs) -> Result<AppendEntryReply> {
         info!(
             "{}: running append entries rpc: {args:?}",
             self.raft().describe()
@@ -478,6 +607,7 @@ impl RaftHandle {
         let reply = {
             let mut raft = self.raft();
             let term = raft.term();
+            let last_committed = raft.last_committed;
             let is_candidate = raft.state.role == Role::Candidate;
             // Reset election timeout if we've get a message from the leader.
             if raft.term() <= args.term {
@@ -493,8 +623,28 @@ impl RaftHandle {
                 self.transfer_state(args.term, Role::Follower);
             }
 
-            AppendEntriesReply {
+            if last_committed < args.last_committed {
+                let mut raft = self.raft();
+                info!(
+                    "{}: new last committed {}",
+                    raft.describe(),
+                    args.last_committed
+                );
+                raft.last_committed = args.last_committed;
+            }
+
+            if !args.entry.is_empty() {
+                // TODO: add checks and overwriting
+                let mut raft = self.raft();
+                info!("{}: appending new entry {:?}", raft.describe(), &args.entry);
+                let index = raft.log.append(args.term, args.entry);
+                assert!(index == args.index);
+                raft.apply(index);
+            }
+
+            AppendEntryReply {
                 term: self.raft().term(),
+                success: true,
             }
         };
         // if you need to persist or call async functions here,
@@ -514,15 +664,13 @@ impl RaftHandle {
 
 // HINT: put mutable non-async functions here
 impl Raft {
-    fn start(&mut self, data: &[u8]) -> Result<Start> {
-        todo!("start agreement");
-    }
-
     // Here is an example to apply committed message.
-    fn apply(&self) {
+    fn apply(&self, index: u64) {
+        let entry = self.log.entry(index).clone();
+        info!("applying {:?} index {:?}", &entry, index);
         let msg = ApplyMsg::Command {
-            data: todo!("apply msg"),
-            index: todo!("apply msg"),
+            data: entry.expect("no such entry").clone(),
+            index,
         };
         self.apply_ch.unbounded_send(msg).unwrap();
     }
@@ -539,11 +687,46 @@ impl Raft {
         self.tasks.push(task::spawn(f))
     }
 
+    //fn commit(&mut self, index: u64) {}
+
+    fn advance_next_index(&mut self, peer: &SocketAddr) {
+        self.next_index.get_mut(peer).map(|x| x.add_assign(1));
+    }
+
+    fn try_commit_new_entries(&mut self) {
+        let mut last_sent: Vec<_> = self
+            .next_index
+            .iter()
+            .map(|(_, x)| x.saturating_sub(1))
+            .collect();
+
+        last_sent.sort();
+        let new_last_committed = last_sent[last_sent.len() / 2];
+        let old_last_committed = self.last_committed;
+
+        if old_last_committed < new_last_committed {
+            info!(
+                "{}: committing new index {}",
+                self.describe(),
+                new_last_committed
+            );
+            self.last_committed = new_last_committed;
+        }
+
+        for idx in old_last_committed + 1..=new_last_committed {
+            self.apply(idx)
+        }
+    }
+
     fn abort_tasks(&mut self) {
         self.tasks.clear()
     }
 
-    fn generate_heartbeat_timeout() -> Duration {
+    fn log_inspection_timeout() -> Duration {
+        Self::heartbeat_timeout() / 2
+    }
+
+    fn heartbeat_timeout() -> Duration {
         Duration::from_millis(50)
     }
 
@@ -570,9 +753,13 @@ impl Raft {
 
     fn describe(&self) -> String {
         format!(
-            "raft(peer: {}, role: {:?}, term: {})",
-            self.me, self.state.role, self.state.term
+            "raft(peer: {}, role: {:?}, term: {}, committed: {})",
+            self.me, self.state.role, self.state.term, self.last_committed,
         )
+    }
+
+    fn is_majority(&self, n: usize) -> bool {
+        n >= self.peers.len() / 2 + 1
     }
 }
 
@@ -589,11 +776,15 @@ struct RequestVoteReply {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AppendEntriesArgs {
+struct AppendEntryArgs {
     term: u64,
+    index: u64,
+    last_committed: u64,
+    entry: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AppendEntriesReply {
+struct AppendEntryReply {
     term: u64,
+    success: bool,
 }

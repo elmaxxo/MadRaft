@@ -239,6 +239,7 @@ impl RaftTester {
                 // submitted our command; wait a while for agreement.
                 let t1 = Instant::now();
                 while t1.elapsed() < Duration::from_secs(2) {
+                    info!("n_committed({}) = {:?}", index, self.n_committed(index));
                     let (nd, cmd1) = self.n_committed(index);
                     if nd > 0 && nd >= expected_servers {
                         // committed
@@ -307,6 +308,7 @@ impl RaftTester {
                         debug!("server {} apply {}", i, index);
                         let entry =
                             bincode::deserialize(&data).expect("committed command is not an entry");
+                        info!("pushing entry");
                         storage.push_and_check(i, index, entry);
                         if snapshot && (index + 1) % SNAPSHOT_INTERVAL == 0 {
                             raft.snapshot(index, &data).await.unwrap();
